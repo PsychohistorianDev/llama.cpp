@@ -4509,6 +4509,14 @@ private:
                             }
                         }
 
+                        // --checkpoint-every: end the batch at each multiple of N inside the prompt, so the next batch
+                        // starts there and a checkpoint is taken at it (a long single message gets checkpoints too)
+                        if (do_checkpoint && params_base.checkpoint_every > 0 &&
+                                slot.prompt.n_tokens() % params_base.checkpoint_every == 0 &&
+                                slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -4540,6 +4548,8 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_every_start = params_base.checkpoint_every > 0 && n_tokens_start > 0 &&
+                            n_tokens_start % params_base.checkpoint_every == 0;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -4557,7 +4567,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_every_start) {
                             do_checkpoint = false;
                         }
                     }
@@ -4577,7 +4587,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_every_start ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 

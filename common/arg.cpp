@@ -1663,6 +1663,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-every"}, "N",
+        string_format("also create a context checkpoint every N tokens inside a long prompt, so a prompt that changes\n"
+            "partway through a long message (e.g. a system prompt) can reuse the cache up to the change on SWA models\n"
+            "(default: %d, 0 = only at user messages and near the end of the prompt)", params.checkpoint_every),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("checkpoint-every must be non-negative");
+            }
+            params.checkpoint_every = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_EVERY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
