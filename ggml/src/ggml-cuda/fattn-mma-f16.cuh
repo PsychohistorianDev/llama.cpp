@@ -2066,13 +2066,16 @@ static __global__ void flash_attn_ext_f16(
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 
-// The q4_0 K/V read at D=512 is on unless GGML_CUDA_FA_Q4_FUSED=0 (the stock path: the cache converted to f16 first).
-static bool ggml_cuda_fattn_mma_q4_0_fused_enabled() {
-    static const bool enabled = [] {
+// The q4_0 K/V read at D=512 serves a call with at most this many query tiles per K/V head (default 1: writing, and
+// reads of up to ncols1 tokens). Each tile dequantizes all of K and V on its own, so a long read with many tiles is
+// faster with the shared f16 copy (measured: 147K-token reads 19% slower with it everywhere, writing at 147K 55%
+// faster). GGML_CUDA_FA_Q4_FUSED=0 turns it off (the stock path), =N allows up to N tiles.
+static int ggml_cuda_fattn_mma_q4_0_fused_max_tiles() {
+    static const int max_tiles = [] {
         const char * e = getenv("GGML_CUDA_FA_Q4_FUSED");
-        return !(e && strcmp(e, "0") == 0);
+        return e && *e ? std::max(0, atoi(e)) : 1;
     }();
-    return enabled;
+    return max_tiles;
 }
 
 // The dense kernel for this case, reading K/V as q4_0 when kv_q4_0 (D=512 only), with its shared memory limit raised once.
@@ -2153,12 +2156,13 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #endif // defined(GGML_USE_HIP)
     // A q4_0 cache at D=512 (Gemma 4's full-attention layers) is read by the kernel as it is, 16 bytes of the f16 tile
     // at a time, instead of converting all of K and V to f16 before every call - at depth that copy is most of the
-    // memory traffic of a written token. The sparse gather keeps the f16 copy.
+    // memory traffic of a written token. Long reads (many query tiles) and the sparse gather keep the f16 copy.
     bool kv_q4_0 = false;
     if constexpr (DKQ == 512 && DV == 512 && !V_is_K_view) {
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
-        kv_q4_0 = ggml_cuda_fattn_mma_q4_0_fused_enabled() && nstages <= 1 &&
+        const int64_t ntiles_x = (dst->src[0]->ne[1] + ncols1 - 1) / ncols1;
+        kv_q4_0 = ntiles_x <= ggml_cuda_fattn_mma_q4_0_fused_max_tiles() && nstages <= 1 &&
             K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
             K->nb[1] % sizeof(half2) == 0 && V->nb[1] % sizeof(half2) == 0 &&
             K->nb[2] % 2 == 0 && V->nb[2] % 2 == 0 && K->nb[3] % 2 == 0 && V->nb[3] % 2 == 0 &&
