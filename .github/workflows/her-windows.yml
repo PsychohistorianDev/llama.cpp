@@ -1,6 +1,6 @@
 # Elysia's build: the Windows x64 CPU package (llama-server, llama-bench and their DLLs) for this branch, built the way
-# the release's windows-cpu job builds it. ggml-cuda.dll and the CUDA runtime come from the official release of the
-# same base commit; this zip goes over a copy of that folder.
+# the release's windows-cpu job builds it, and this branch's ggml-cuda.dll for her card. The CUDA runtime DLLs come from
+# the official release of the same base commit; both zips go over a copy of that folder.
 name: her build (Windows x64)
 
 on:
@@ -32,7 +32,7 @@ jobs:
             -DGGML_CPU_ALL_VARIANTS=ON ^
             -DGGML_OPENMP=ON ^
             -DGGML_OPENMP_FETCH=ON ^
-            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON
           cmake --build build --config Release
 
       - name: Pack
@@ -42,4 +42,44 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           path: her-llama-win-x64-${{ github.sha }}.zip
+          archive: false
+
+  # ggml-cuda.dll of this branch, for her card only (RTX 5090, sm_120), with CUDA 13.4 as the release builds it.
+  # It goes over a folder holding this run's CPU package and the official release's CUDA runtime DLLs.
+  windows-cuda-x64:
+    runs-on: windows-2022
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.4'
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=120a-real ^
+            -DLLAMA_BUILD_BORINGSSL=ON -DGGML_CUDA_CCCL_VERSION=v3.4.3
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Pack
+        run: 7z a -snl her-ggml-cuda-sm120-${{ github.sha }}.zip .\build\bin\Release\ggml-cuda.dll
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          path: her-ggml-cuda-sm120-${{ github.sha }}.zip
           archive: false

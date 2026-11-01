@@ -12183,6 +12183,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Gemma 4's full-attention layers: D=512, GQA 8, a q4_0 cache - the CUDA MMA kernel reads it without an f16 copy
+    for (int kv : { 113, 512, 1024, 4096, }) {
+        for (int nb : { 1, 3, 8, 32, 75, }) {
+            for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_F16, }) {
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            }
+        }
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
