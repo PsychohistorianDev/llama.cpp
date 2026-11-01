@@ -1,0 +1,45 @@
+# Elysia's build: the Windows x64 CPU package (llama-server, llama-bench and their DLLs) for this branch, built the way
+# the release's windows-cpu job builds it. ggml-cuda.dll and the CUDA runtime come from the official release of the
+# same base commit; this zip goes over a copy of that folder.
+name: her build (Windows x64)
+
+on:
+  push:
+    branches: [ 'her/**' ]
+  workflow_dispatch:
+
+jobs:
+  windows-cpu-x64:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            -DGGML_OPENMP_FETCH=ON ^
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON
+          cmake --build build --config Release
+
+      - name: Pack
+        run: 7z a -snl her-llama-win-x64-${{ github.sha }}.zip .\build\bin\Release\*
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          path: her-llama-win-x64-${{ github.sha }}.zip
+          archive: false
