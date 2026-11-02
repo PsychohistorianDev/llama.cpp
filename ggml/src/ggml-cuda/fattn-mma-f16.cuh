@@ -486,47 +486,83 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 
 // K/V straight from a q4_0 cache: each 16-byte chunk of the f16 tile (8 values) is made from one q4_0 block's scale and
 // 8 of its nibbles as d*q - 8*d rounded to half - the very value the to_fp16 pass would have written (exact in float
-// before the one rounding, the sign of a zero included), so the tile is bit-for-bit the one the converted copy gives, without writing that copy
-// for the whole cache and reading it back on every call. KV is the start of the rows in bytes, stride_KV the row stride
-// in half2 units (nb/4, as the kernel computes it), d2_0 the first half2 of the row this tile starts at, D2 its width.
-template<int stride_tile, int nwarps, int nbatch_fa, bool oob_check>
+// before the one rounding, the sign of a zero included), so the tile is bit-for-bit the one the converted copy gives,
+// without writing that copy for the whole cache and reading it back on every call.
+// A thread takes pairs of chunks that share one block's scale and 8 nibble bytes (the low nibbles are one chunk, the
+// high nibbles the chunk 16 values on), and issues the loads of ld_batch pairs before converting any of them, so a
+// warp waits for memory a few times per tile, not once per chunk. Writing (8 query columns, where the kernel has
+// registers to spare) takes GGML_CUDA_FA_Q4_0_LD_BATCH pairs at once; wider tiles take one, or they spill.
+// KV is the start of the rows in bytes, stride_KV the row stride in half2 units (nb/4, as the kernel computes it),
+// d2_0 the first half2 of the row this tile starts at (a whole block: a multiple of 16), D2 its width (<= D2_max).
+#ifndef GGML_CUDA_FA_Q4_0_LD_BATCH
+#define GGML_CUDA_FA_Q4_0_LD_BATCH 8
+#endif // GGML_CUDA_FA_Q4_0_LD_BATCH
+template<int stride_tile, int nwarps, int nbatch_fa, int D2_max, int ld_batch, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_q4_0(
         const char * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int d2_0, const int D2,
         const int stride_KV, const int k_VKQ_0, const int i_sup) {
-    constexpr int warp_size    = ggml_cuda_get_physical_warp_size();
-    constexpr int h2_per_chunk = 4;
-    constexpr int nthreads     = nwarps*warp_size;
-    constexpr int q4_0_bytes   = 2 + 16; // half d, 16 bytes of nibbles: values 0-15 low, 16-31 high
-    const int     chunks_per_row = D2 / h2_per_chunk;
-    const int     nchunks        = nbatch_fa*chunks_per_row;
-    const int64_t row_bytes      = int64_t(stride_KV)*sizeof(half2);
+    constexpr int warp_size        = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads         = nwarps*warp_size;
+    constexpr int q4_0_bytes       = 2 + 16; // half d, 16 bytes of nibbles: values 0-15 low, 16-31 high
+    static_assert(D2_max % 8 == 0, "the q4_0 tile is read in pairs of 16-byte chunks");
+    constexpr int npairs_max       = nbatch_fa*(D2_max/8);
+    constexpr int pairs_per_thread = (npairs_max + nthreads - 1) / nthreads;
+    constexpr int batch            = pairs_per_thread < ld_batch ? pairs_per_thread : ld_batch;
+    static_assert(ld_batch >= 1, "bad ld_batch");
 
-    for (int l0 = 0; l0 < nchunks; l0 += nthreads) {
-        const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-        if (l >= nchunks) {
-            break;
-        }
-        const int i = l / chunks_per_row;
-        const int k = l - i*chunks_per_row;
+    const int     pairs_per_row = D2/8;
+    const int     npairs        = nbatch_fa*pairs_per_row;
+    const int64_t row_bytes     = int64_t(stride_KV)*sizeof(half2);
+    const char *  KV_0          = KV + (d2_0/16)*q4_0_bytes;
+    const int     tid           = threadIdx.y*warp_size + threadIdx.x;
 
-        half2 h[h2_per_chunk] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
-        if (!oob_check || i < i_sup) {
-            const int e  = 2*(d2_0 + k*h2_per_chunk); // first value of the chunk within the row
-            const int j0 = e % 32;
-            const char * blk = KV + int64_t(k_VKQ_0 + i)*row_bytes + (e/32)*q4_0_bytes;
-            const float d = __half2float(*(const half *) blk);
-            const float dm = -8*d; // as dequantize_block_q4_0 writes it: an exact 0 for q = 8 is +0, as there
-            const uint16_t * qs = (const uint16_t *) (blk + 2 + j0 % 16);
-            const int shift = j0 >= 16 ? 4 : 0;
 #pragma unroll
-            for (int m = 0; m < h2_per_chunk; ++m) {
-                const uint32_t q2 = qs[m];
-                const int q_lo = (q2 >> shift)       & 0xF;
-                const int q_hi = (q2 >> (8 + shift)) & 0xF;
-                h[m] = make_half2(__float2half(d*q_lo + dm), __float2half(d*q_hi + dm));
+    for (int p00 = 0; p00 < pairs_per_thread; p00 += batch) {
+        // the loads: a zero scale and zero nibbles (rows past i_sup) make +0 values, as the tile wants there
+        uint16_t d_raw[batch];
+        uint16_t q_raw[batch][4];
+#pragma unroll
+        for (int b = 0; b < batch; ++b) {
+            const int p = (p00 + b)*nthreads + tid;
+            const int i = p / pairs_per_row;
+            const int r = p - i*pairs_per_row;
+            d_raw[b] = 0;
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                q_raw[b][m] = 0;
+            }
+            if (p00 + b < pairs_per_thread && p < npairs && (!oob_check || i < i_sup)) {
+                const uint16_t * blk = (const uint16_t *) (KV_0 + int64_t(k_VKQ_0 + i)*row_bytes + (r/2)*q4_0_bytes);
+                d_raw[b] = blk[0];
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    q_raw[b][m] = blk[1 + 4*(r % 2) + m];
+                }
             }
         }
-        ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + k*h2_per_chunk, i), h);
+        // the conversion, and the two chunks into the tile
+#pragma unroll
+        for (int b = 0; b < batch; ++b) {
+            const int p = (p00 + b)*nthreads + tid;
+            if (p00 + b >= pairs_per_thread || p >= npairs) {
+                continue;
+            }
+            const int i = p / pairs_per_row;
+            const int r = p - i*pairs_per_row;
+            const float d  = __half2float(__ushort_as_half(d_raw[b]));
+            const float dm = -8*d; // as dequantize_block_q4_0 writes it: an exact 0 for q = 8 is +0, as there
+            half2 lo[4];
+            half2 hi[4];
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const uint32_t q2 = q_raw[b][m];
+                lo[m] = make_half2(__float2half(d*int( q2       & 0xF) + dm), __float2half(d*int((q2 >>  8) & 0xF) + dm));
+                hi[m] = make_half2(__float2half(d*int((q2 >> 4) & 0xF) + dm), __float2half(d*int((q2 >> 12) & 0xF) + dm));
+            }
+            const int k_lo = (r/2)*4 + r % 2; // in 16-byte chunks; the high nibbles are 2 chunks on
+            ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + (k_lo + 0)*4, i), lo);
+            ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + (k_lo + 2)*4, i), hi);
+        }
     }
 }
 
@@ -664,6 +700,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
 
     static_assert(!KV_q4_0 || (nstages <= 1 && !use_sparse && !V_is_K_view), "q4_0 K/V is read in the single-stage dense path only");
+    constexpr int q4_0_ld_batch = ncols <= 8 ? GGML_CUDA_FA_Q4_0_LD_BATCH : 1;
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
 #if defined(TURING_MMA_AVAILABLE)
@@ -702,7 +739,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int k0_diff = k0_stop - k0_start;
             constexpr bool use_cp_async = nstages == 1;
             if constexpr (KV_q4_0) {
-                flash_attn_ext_f16_load_tile_q4_0<stride_tile_K, nwarps, nbatch_fa, oob_check>
+                flash_attn_ext_f16_load_tile_q4_0<stride_tile_K, nwarps, nbatch_fa, nbatch_K2, q4_0_ld_batch, oob_check>
                     ((const char *) K_h2, tile_K, k0_start, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup);
             } else {
                 flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
@@ -1060,7 +1097,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
                 if constexpr (KV_q4_0) {
-                    flash_attn_ext_f16_load_tile_q4_0<stride_tile_V, nwarps, nbatch_fa, oob_check>
+                    flash_attn_ext_f16_load_tile_q4_0<stride_tile_V, nwarps, nbatch_fa, nbatch_V2, q4_0_ld_batch, oob_check>
                         ((const char *) V_h2, tile_V, i0_start/2, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup);
                 } else {
                     flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
