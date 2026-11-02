@@ -12634,6 +12634,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Gemma 4 31B attention at depth with a q4_0 or f16 cache: full layers D=512 (4 KV heads, GQA 8), sliding layers D=256 (16 KV heads, GQA 2, window 1024 + ubatch)
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
+        for (int kv : {32768, 147456}) {
+            for (int nb : {1, 512, 2048}) {
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+        for (int nb : {512, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, 1024 + nb, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
+    }
+
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
 
